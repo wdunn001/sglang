@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
+from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -183,7 +185,24 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
-        """Handle streaming completion request"""
+        """Handle streaming completion request.
+
+        Dispatches to the binary Codec generator when stream_format is
+        'msgpack' or 'protobuf'; otherwise uses the standard SSE path.
+        """
+        if request.stream_format != "json":
+            media_type = (
+                "application/x-protobuf"
+                if request.stream_format == "protobuf"
+                else "application/x-msgpack"
+            )
+            return wrap_streaming_response(
+                raw_request.headers.get("accept-encoding", ""),
+                self._generate_binary_stream(adapted_request, request, raw_request),
+                media_type=media_type,
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+            )
+
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
         )
@@ -204,6 +223,64 @@ class OpenAIServingCompletion(OpenAIServingBase):
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
+
+    async def _generate_binary_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: CompletionRequest,
+        raw_request: Request,
+    ):
+        """
+        Yield raw Codec frames (bytes) for binary stream_format requests.
+
+        Token IDs come straight from `content["output_ids"]` — the
+        TokenizerManager surfaces them in the streamed dict regardless of
+        whether logprobs were requested. No detokenization, no logprob
+        machinery, no top-k overhead.
+
+        The shape of `output_ids` depends on the server's incremental mode:
+          incremental_streaming_output=True  → already a per-chunk delta
+          incremental_streaming_output=False → cumulative; slice by length
+
+        For agent-to-agent workloads the caller passes the yielded IDs
+        directly into the next model's prompt without ever materialising text.
+        """
+        n_prev_tokens: dict[int, int] = {}
+        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+        try:
+            async for content in self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ):
+                index = content.get("index", 0)
+                output_ids = content.get("output_ids") or []
+
+                if incremental:
+                    new_ids = list(output_ids)
+                else:
+                    n_prev = n_prev_tokens.get(index, 0)
+                    new_ids = list(output_ids[n_prev:])
+                    n_prev_tokens[index] = len(output_ids)
+
+                meta = content.get("meta_info", {}) or {}
+                finish_reason_obj = meta.get("finish_reason")
+                finish_reason = finish_reason_obj["type"] if finish_reason_obj else None
+                done = finish_reason is not None
+
+                yield encode_frame(
+                    request.stream_format,
+                    new_ids,
+                    done=done,
+                    finish_reason=finish_reason,
+                )
+                if done:
+                    return
+
+        except Exception:
+            # Emit a terminal error frame so binary clients can distinguish
+            # a server error from a cleanly truncated stream.
+            yield encode_frame(
+                request.stream_format, [], done=True, finish_reason="error"
+            )
 
     async def _generate_completion_stream(
         self,
