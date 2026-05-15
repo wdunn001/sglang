@@ -1526,6 +1526,19 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    # Codec version-negotiation gate. Default-off; only fires when the
+    # deployment has CODEC_*_REQUIRED set and the client speaks below
+    # the floor. See spec/versions/v0.4.md § Version Compatibility Signaling.
+    from sglang.srt.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
+
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
+
     return await raw_request.app.state.openai_serving_completion.handle_request(
         request, raw_request
     )
@@ -1559,7 +1572,21 @@ async def openai_v1_completions_codec(raw_request: Request):
         decode_msgpack,
         decode_protobuf_request,
     )
+    from sglang.srt.entrypoints.codec_version import (
+        make_426_response,
+        needs_upgrade,
+        parse_client_version,
+    )
     from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+
+    # Version negotiation gate. Per spec § Version Compatibility Signaling,
+    # if the deployment has any v0.4 capability set to ENFORCE and the
+    # client's advertised version is below the floor, refuse with 426
+    # before doing any work. Servers without enforce stages set never
+    # 426 for version reasons — opt-on default OFF.
+    client_version = parse_client_version(raw_request)
+    if needs_upgrade(client_version):
+        return make_426_response(client_version=client_version)
 
     content_type = raw_request.headers.get("content-type", "application/x-msgpack")
     body = await raw_request.body()
@@ -1610,6 +1637,28 @@ async def codec_schema():
     from sglang.srt.entrypoints.codec_frame import PROTO_SCHEMA
 
     return PlainTextResponse(PROTO_SCHEMA, media_type="text/plain")
+
+
+@app.get("/.well-known/codec/version-policy.json")
+async def well_known_version_policy():
+    """Pre-flight discovery for the runtime 426 / VERSION_INCOMPATIBLE
+    contract. Per `spec/WELL_KNOWN_DISCOVERY.md § Version policy (v0.4+)`
+    a deployment that mandates v0.4+ features publishes its minimum-version
+    requirement here.
+
+    Returns 404 when no v0.4 capability is required — the spec says
+    deployments without mandatory features SHOULD NOT publish this
+    document because its presence advertises that older clients will
+    be rejected.
+    """
+    from fastapi.responses import JSONResponse, Response as FastResponse
+
+    from sglang.srt.entrypoints.codec_version import version_policy_document
+
+    doc = version_policy_document()
+    if doc is None:
+        return FastResponse(status_code=404)
+    return JSONResponse(doc)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])

@@ -241,6 +241,7 @@ def wrap_streaming_response(
     background=None,
     extra_headers: Optional[dict] = None,
     stream_format: Optional[str] = None,
+    client_version: Optional[str] = None,
 ) -> StreamingResponse:
     """Build a StreamingResponse with compression chosen from Accept-Encoding.
 
@@ -251,7 +252,16 @@ def wrap_streaming_response(
     ``stream_format`` is the request's ``stream_format`` field
     (``"msgpack"`` / ``"protobuf"`` / ``"json"``) and gates the zstd path
     via the dict registry — see ``negotiate_encoding``.
+
+    ``client_version`` is the value of the request's ``Codec-Client-Version``
+    header (or ``"0.2"`` default). When set, Codec-* response headers are
+    filtered to the floor for that version per
+    `spec/versions/v0.4.md § Graceful downgrade` — e.g. a v0.3 client
+    receives Codec-Zstd-Dict (v0.2-stable) but not Codec-Safety-Policy
+    (v0.4-introduced).
     """
+    from sglang.srt.entrypoints.codec_version import filter_codec_headers
+
     encoding = negotiate_encoding(accept_encoding, stream_format=stream_format)
     headers: dict = {"Vary": "Accept-Encoding"}
     if extra_headers:
@@ -282,6 +292,13 @@ def wrap_streaming_response(
         headers["Content-Encoding"] = "gzip"
     else:
         body = body_stream
+
+    # Apply graceful-downgrade filter when a client version is known.
+    # Headers introduced in v0.4+ are dropped for v0.3- clients.
+    # Per spec § Capabilities are opt-on at the server, this is the
+    # last seam where v0.4 wire bytes could leak to older clients.
+    if client_version is not None:
+        headers = filter_codec_headers(headers, client_version)
 
     return StreamingResponse(
         body,
