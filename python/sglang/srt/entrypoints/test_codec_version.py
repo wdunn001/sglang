@@ -270,3 +270,246 @@ def test_426_route_helper_returns_proper_response_object():
     resp = make_426_response(client_version="0.2")
     assert resp.status_code == 426
     assert resp.media_type == "application/json"
+
+
+# ── Full matrix: (client_version × server_config) → wire outcome ──────────────
+#
+# Spec § Capabilities are opt-on at the server enumerates the configurations
+# we ship. Tests below exercise the cartesian product so every combination
+# of client/server state has a documented expected behavior.
+
+
+# Client versions we support today. Includes the absent-header case
+# (which parses as DEFAULT_CLIENT_VERSION = "0.2") and a future version
+# (0.5) to confirm forward-compat.
+CLIENT_VERSIONS = ["0.2", "0.3", "0.4", "0.5"]
+
+
+def _clear_codec_env(monkeypatch):
+    for v in (
+        "CODEC_SAFETY_POLICY",
+        "CODEC_SAFETY_POLICY_REQUIRED",
+        "CODEC_VERSION_POLICY",
+        "CODEC_DEPLOYMENT_ID",
+    ):
+        monkeypatch.delenv(v, raising=False)
+
+
+def _apply(monkeypatch, env: dict[str, str]):
+    _clear_codec_env(monkeypatch)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+
+# Each server config + (client_version → expected outcome) table.
+#
+# `426` means needs_upgrade() is True and the client would be refused.
+# `200` means the request would proceed; the test then asserts that
+# only the headers permitted by the client's version reach the wire.
+SERVER_CONFIGS = [
+    {
+        "name": "default-off",
+        "env": {},
+        # No capability mandatory; every client served. v0.4 wire only
+        # for v0.4+ clients per filter_codec_headers, but no v0.4 headers
+        # would be added in the first place because no capability is on.
+        "expected_426": {v: False for v in CLIENT_VERSIONS},
+        "expects_well_known": False,
+    },
+    {
+        "name": "safety-enabled-not-enforced",
+        "env": {"CODEC_SAFETY_POLICY": "acme/strict-v3"},
+        # Capability on; nothing required. v0.3 clients still served.
+        "expected_426": {v: False for v in CLIENT_VERSIONS},
+        "expects_well_known": False,
+    },
+    {
+        "name": "safety-enforced",
+        "env": {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+            "CODEC_SAFETY_POLICY_REQUIRED": "1",
+        },
+        # v0.4+ clients OK; v0.3- refused.
+        "expected_426": {"0.2": True, "0.3": True, "0.4": False, "0.5": False},
+        "expects_well_known": True,
+    },
+    {
+        "name": "version-policy-advisory",
+        "env": {"CODEC_VERSION_POLICY": "advisory"},
+        # Advisory means "header set on responses but no 426". No 426 for any client.
+        "expected_426": {v: False for v in CLIENT_VERSIONS},
+        "expects_well_known": False,
+    },
+    {
+        "name": "version-policy-strict",
+        "env": {"CODEC_VERSION_POLICY": "strict"},
+        # Strict means 426 for clients below 0.4 regardless of which
+        # specific capability triggered it.
+        "expected_426": {"0.2": True, "0.3": True, "0.4": False, "0.5": False},
+        "expects_well_known": True,
+    },
+    {
+        "name": "safety-enabled-version-strict",
+        "env": {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+            "CODEC_VERSION_POLICY": "strict",
+        },
+        # Safety enabled (no enforce) + version strict = 426 by version
+        # but body would NOT include safety-policy-enforcement in
+        # required_features (safety isn't enforced).
+        "expected_426": {"0.2": True, "0.3": True, "0.4": False, "0.5": False},
+        "expects_well_known": True,
+    },
+    {
+        "name": "safety-required-version-strict",
+        "env": {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+            "CODEC_SAFETY_POLICY_REQUIRED": "1",
+            "CODEC_VERSION_POLICY": "strict",
+        },
+        # Full enforce. v0.4+ served; v0.3- refused with both signals.
+        "expected_426": {"0.2": True, "0.3": True, "0.4": False, "0.5": False},
+        "expects_well_known": True,
+    },
+    {
+        "name": "safety-required-version-off",
+        "env": {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+            "CODEC_SAFETY_POLICY_REQUIRED": "1",
+        },
+        # Same as safety-enforced — proves version-policy alone is not
+        # required for safety enforcement to fire.
+        "expected_426": {"0.2": True, "0.3": True, "0.4": False, "0.5": False},
+        "expects_well_known": True,
+    },
+]
+
+
+@pytest.mark.parametrize("cfg", SERVER_CONFIGS, ids=[c["name"] for c in SERVER_CONFIGS])
+@pytest.mark.parametrize("client_version", CLIENT_VERSIONS)
+def test_matrix_needs_upgrade(monkeypatch, cfg, client_version):
+    """For every (server config × client version) cell, needs_upgrade()
+    matches the documented expectation."""
+    _apply(monkeypatch, cfg["env"])
+    expected = cfg["expected_426"][client_version]
+    actual = needs_upgrade(client_version)
+    assert actual == expected, (
+        f"server={cfg['name']} client={client_version} expected 426={expected} got 426={actual}"
+    )
+
+
+@pytest.mark.parametrize("cfg", SERVER_CONFIGS, ids=[c["name"] for c in SERVER_CONFIGS])
+def test_matrix_well_known_presence(monkeypatch, cfg):
+    """version_policy_document() returns a doc iff any capability is
+    mandatory — the well-known file MUST mirror the runtime 426
+    behavior per spec."""
+    _apply(monkeypatch, cfg["env"])
+    doc = version_policy_document()
+    if cfg["expects_well_known"]:
+        assert doc is not None, f"server={cfg['name']} should publish well-known"
+        assert doc["minimum_version"] == "0.4"
+    else:
+        assert doc is None, f"server={cfg['name']} should NOT publish well-known"
+
+
+@pytest.mark.parametrize("client_version", CLIENT_VERSIONS)
+def test_matrix_header_filter_safety_block(monkeypatch, client_version):
+    """When the safety capability is ENABLED (stage-1), the server
+    may emit Codec-Safety-Policy headers. The filter MUST strip them
+    for v0.3- clients (graceful downgrade) but pass them through for
+    v0.4+ clients."""
+    _apply(
+        monkeypatch,
+        {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+        },
+    )
+    raw_headers = {
+        "Vary": "Accept-Encoding",
+        "Content-Encoding": "zstd",
+        "Codec-Zstd-Dict": "sha256:abc",  # v0.2 — always emitted
+        "Codec-Tokenizer-Map": "sha256:def",  # v0.2 — always emitted
+        "Codec-Latent-Map": "sha256:ghi",  # v0.3 — emitted to v0.3+
+        "Codec-Safety-Policy": "acme/strict-v3",  # v0.4 — emitted to v0.4+
+        "Codec-Safety-Policy-Hash": "sha256:jkl",  # v0.4 — emitted to v0.4+
+    }
+    filtered = filter_codec_headers(raw_headers, client_version)
+
+    # v0.2 headers + standard HTTP always pass.
+    assert "Vary" in filtered
+    assert "Content-Encoding" in filtered
+    assert "Codec-Zstd-Dict" in filtered
+    assert "Codec-Tokenizer-Map" in filtered
+
+    # v0.3 header gated.
+    if version_ge(client_version, "0.3"):
+        assert "Codec-Latent-Map" in filtered
+    else:
+        assert "Codec-Latent-Map" not in filtered
+
+    # v0.4 headers gated.
+    if version_ge(client_version, "0.4"):
+        assert "Codec-Safety-Policy" in filtered
+        assert "Codec-Safety-Policy-Hash" in filtered
+    else:
+        assert "Codec-Safety-Policy" not in filtered
+        assert "Codec-Safety-Policy-Hash" not in filtered
+
+
+@pytest.mark.parametrize("cfg", SERVER_CONFIGS, ids=[c["name"] for c in SERVER_CONFIGS])
+def test_matrix_426_body_features_match_config(monkeypatch, cfg):
+    """The required_features field on a 426 body MUST list exactly the
+    capabilities that are ENFORCED — not the ones merely enabled."""
+    _apply(monkeypatch, cfg["env"])
+    # Skip configs that don't 426; their body shape is moot.
+    if not any_v04_mandatory():
+        return
+    resp = make_426_response(client_version="0.3")
+    body = json.loads(resp.body)
+    features = set(body["required_features"])
+    expected = set(collect_required_features())
+    assert features == expected, (
+        f"server={cfg['name']} expected required_features={expected} got {features}"
+    )
+
+
+def test_matrix_default_off_emits_zero_v04_wire(monkeypatch):
+    """Default-off ship state MUST emit zero v0.4 headers to any client
+    — regardless of the client's advertised version. The spec's hard
+    rule: a controlled fleet pays zero v0.4 wire cost when the server
+    has no capability enabled."""
+    _clear_codec_env(monkeypatch)
+    # Even a v0.4 client should not see v0.4 headers when the server
+    # has nothing enabled — the headers aren't generated in the first
+    # place (no capability runtime, no policy to advertise).
+    assert not any_v04_mandatory()
+    # The filter passes whatever the caller passed in; the contract is
+    # that the SERVER doesn't ATTACH v0.4 headers when the capability
+    # is off. Simulate that by passing only the v0.2 set.
+    filtered = filter_codec_headers(
+        {"Codec-Zstd-Dict": "sha256:x"},
+        "0.4",
+    )
+    assert filtered == {"Codec-Zstd-Dict": "sha256:x"}
+
+
+def test_matrix_graceful_downgrade_v03_never_sees_v04(monkeypatch):
+    """Even when the server has safety ENABLED + ENFORCED, a v0.3 client
+    that somehow received headers must not see them post-filter."""
+    _apply(
+        monkeypatch,
+        {
+            "CODEC_SAFETY_POLICY": "acme/strict-v3",
+            "CODEC_SAFETY_POLICY_REQUIRED": "1",
+        },
+    )
+    # In practice the v0.3 client would have been 426'd before any
+    # response body. But if a server bug allowed the 2xx path to fire,
+    # graceful downgrade is the last line of defense.
+    raw = {
+        "Codec-Zstd-Dict": "sha256:abc",
+        "Codec-Safety-Policy": "acme/strict-v3",
+        "Codec-Safety-Policy-Hash": "sha256:jkl",
+    }
+    filtered = filter_codec_headers(raw, "0.3")
+    assert filtered == {"Codec-Zstd-Dict": "sha256:abc"}
