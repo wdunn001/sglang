@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/model_loader/loader.py
 
 from __future__ import annotations
@@ -104,6 +106,7 @@ from sglang.srt.model_loader.weight_utils import (
     safetensors_weights_iterator,
     set_runai_streamer_env,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -234,6 +237,11 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 
@@ -523,6 +531,9 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
             prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            weight_loader_drop_cache_after_load = (
+                server_args.weight_loader_drop_cache_after_load
+            )
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -537,6 +548,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -544,6 +556,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:
@@ -1209,7 +1222,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         del current_param_data
         if is_last_update:
             gc.collect()
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
         logger.info("[QuantizedRL] Reload complete")
         return updated_param_names, is_last_update
@@ -1900,7 +1913,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
         model.load_weights(qweight_iterator)
 
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         param_dict = dict(model.named_parameters())
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
@@ -2208,7 +2221,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         end_build_group_tic = time.time()
         logger.debug(
             f"finish building group for remote instance, time used: {(end_build_group_tic - start_build_group_tic):.4f}s"
@@ -2234,7 +2247,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     src=0,
                     group=client._model_update_group,
                 )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
 
             _post_load_weights(model)
         end_get_weights_tic = time.time()
@@ -2245,7 +2258,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         torch.distributed.distributed_c10d.destroy_process_group(
             client._model_update_group
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
         self, model, transfer_engine, seed_url, tp_rank
