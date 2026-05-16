@@ -219,13 +219,16 @@ async def _compress_gzip(stream: AsyncIterable[bytes]) -> AsyncIterable[bytes]:
 
 async def _compress_brotli(stream: AsyncIterable[bytes]) -> AsyncIterable[bytes]:
     """Stream-compress with Brotli at quality 4 (gzip-level CPU, slightly
-    better ratio). Default quality 11 is 10-50x slower for streams."""
+    better ratio). Default quality 11 is 10-50x slower for streams.
+
+    Per-chunk flush() was removed after the v0.4.1 bench discovered it inflated
+    small streams (64-token msgpack: 1159 B vs 975 B identity; 512-token: 9013
+    B vs 7616 B). Each flush emits a complete brotli block + its own header,
+    so calling it on every chunk forfeits brotli's between-chunk dictionary
+    sharing. The remaining ``finish()`` flushes once at stream end."""
     compressor = brotli.Compressor(quality=4, mode=brotli.MODE_GENERIC, lgwin=22)
     async for chunk in stream:
         out = compressor.process(chunk)
-        if out:
-            yield out
-        out = compressor.flush()
         if out:
             yield out
     final = compressor.finish()
