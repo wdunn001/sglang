@@ -16,6 +16,12 @@ from sglang.srt.entrypoints.codec_agent import (
     parse_tool_call,
 )
 from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
+from sglang.srt.entrypoints.codec_dispatcher import (
+    CODEC_BOLT_ON_DISPATCH,
+    ToolRegistry,
+    dispatch_call,
+    reinject_ids_into_context,
+)
 from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
@@ -280,6 +286,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # default path; the win is upstream PyLong-list elimination.
         bypass_buffers = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
 
+        # v0.5 #87 (bolt-on tool dispatcher): when CODEC_BOLT_ON_DISPATCH=1
+        # AND the ToolWatcher detects a completed tool-call region, look
+        # up the tool by parsed name in the registry. If registered in
+        # dispatch mode, POST a CodecToolCall to its endpoint and yield
+        # the response's response_ids as the next frame's tokens (the
+        # reinjection contract in codec_dispatcher.reinject_ids_into_context).
+        # If not registered or in text-fallback mode, surface the
+        # detected region to the client unchanged (existing behaviour).
+        dispatcher_registry: Optional[ToolRegistry] = None
+        if CODEC_BOLT_ON_DISPATCH and watcher is not None:
+            tokenizer_hash = getattr(self.tokenizer_manager, "tokenizer_map_hash", "")
+            dispatcher_registry = ToolRegistry.from_env(tokenizer_hash)
+
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -322,6 +341,39 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             body_text, call_id=make_call_id(tool_call_seq)
                         )
                         tool_calls_payload.append(ev.to_wire_dict())
+
+                        # v0.5 #87: try in-engine dispatch when registered.
+                        if dispatcher_registry is not None and ev.name:
+                            tool = dispatcher_registry.get(ev.name)
+                            if tool is not None and tool.mode == "dispatch":
+                                try:
+                                    result = dispatch_call(
+                                        tool,
+                                        arguments_json=ev.arguments_json,
+                                        call_id=ev.id or make_call_id(tool_call_seq),
+                                    )
+                                    if not result.is_error and result.response_ids:
+                                        # Append the tool's response IDs to the
+                                        # stream so the model "reads" them as
+                                        # its next input. The detailed
+                                        # KV-cache-aware reinjection is in
+                                        # tokenizer_manager (follow-up); this
+                                        # simple append matches the contract
+                                        # in reinject_ids_into_context.
+                                        new_ids = reinject_ids_into_context(
+                                            new_ids, result.response_ids,
+                                        )
+                                except Exception as e:
+                                    # Dispatch failure surfaces to the client
+                                    # as an unhandled tool call — same as if
+                                    # the tool wasn't registered. The error
+                                    # is logged but doesn't tear down the
+                                    # stream.
+                                    import logging as _log
+                                    _log.getLogger(__name__).warning(
+                                        "codec_dispatcher: dispatch_call(%s) failed: %s",
+                                        ev.name, e,
+                                    )
 
                 yield encode_frame(
                     request.stream_format,
