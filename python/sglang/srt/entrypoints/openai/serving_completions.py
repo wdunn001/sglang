@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -270,6 +271,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 end_id=int(request.tool_watcher["end_id"]),
             )
 
+        # v0.5 #76 (T1.4 OpenAI-bypass): when CODEC_OPENAI_BYPASS=1 AND
+        # the tokenizer_manager surfaces output_ids as a numpy array
+        # (upstream work — until then sglang ships List[int]), pass the
+        # buffer through to the encoder without intermediate List[int]
+        # allocation. encoder accepts ndarray / array.array / bytes since
+        # the codec_frame.py change. Wire bytes are byte-identical to the
+        # default path; the win is upstream PyLong-list elimination.
+        bypass_buffers = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
+
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -277,11 +287,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 index = content.get("index", 0)
                 output_ids = content.get("output_ids") or []
 
+                # Detect numpy / array.array / bytes path (upstream may surface
+                # these when the engine is configured for the bypass).
+                is_buffer = bypass_buffers and not isinstance(output_ids, list)
+
                 if incremental:
-                    new_ids = list(output_ids)
+                    new_ids = output_ids if is_buffer else list(output_ids)
                 else:
                     n_prev = n_prev_tokens.get(index, 0)
-                    new_ids = list(output_ids[n_prev:])
+                    new_ids = (
+                        output_ids[n_prev:] if is_buffer
+                        else list(output_ids[n_prev:])
+                    )
                     n_prev_tokens[index] = len(output_ids)
 
                 meta = content.get("meta_info", {}) or {}

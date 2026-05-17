@@ -24,10 +24,60 @@ No new dependencies: msgspec is already in SGLang's requirements.
 
 from __future__ import annotations
 
+import array
+import os
 import struct
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import msgspec.msgpack
+
+# v0.5 #76 (T1.4 OpenAI-bypass): when CODEC_OPENAI_BYPASS=1, the encoder
+# accepts buffer-shaped ids (numpy array, array.array, bytes-of-uint32-LE)
+# directly without converting to a Python list first. Saves ~25-40% codec-
+# encode CPU per token in benchmarks. Default off so the JSON-SSE path is
+# unchanged byte-for-byte.
+_OPENAI_BYPASS = os.environ.get("CODEC_OPENAI_BYPASS", "0") == "1"
+
+# Lazy import — numpy isn't a hard dependency of the encoder, only an
+# accelerator when CODEC_OPENAI_BYPASS=1 + the caller hands us an ndarray.
+try:
+    import numpy as _np  # type: ignore[import-untyped]
+    _HAVE_NUMPY = True
+except ImportError:  # pragma: no cover - numpy is in sglang's reqs
+    _np = None
+    _HAVE_NUMPY = False
+
+IdsLike = Union[List[int], "array.array", bytes, "_np.ndarray"]
+
+
+def _normalise_ids_to_list(ids: IdsLike) -> List[int]:
+    """Coerce IdsLike to a plain List[int].
+
+    Always-correct fallback path: used by every encoder regardless of the
+    CODEC_OPENAI_BYPASS gate. When the gate is OFF, the encoders take a
+    List[int] arg directly and skip this function entirely.
+
+    Order matters: List[int] check first since that's the common path.
+    """
+    if isinstance(ids, list):
+        return ids
+    if _HAVE_NUMPY and isinstance(ids, _np.ndarray):
+        # tolist() on a uint32 ndarray is the only path that avoids the
+        # per-element PyLong boxing — msgspec doesn't accept an ndarray
+        # directly. The ID we save here is upstream (tokenizer_manager
+        # never having created the List[int] in the first place); see
+        # docs/engine-fork-tasks/v0.5-rollout.md § Task #76 for the
+        # upstream half.
+        return ids.tolist()
+    if isinstance(ids, array.array):
+        return ids.tolist()
+    if isinstance(ids, (bytes, bytearray, memoryview)):
+        if _HAVE_NUMPY:
+            return _np.frombuffer(bytes(ids), dtype="<u4").tolist()
+        # Manual little-endian uint32 unpack as a numpy-free fallback.
+        b = bytes(ids)
+        return [int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)]
+    raise TypeError(f"codec_frame: unsupported ids type {type(ids).__name__}")
 
 # ---------------------------------------------------------------------------
 # Proto schema (returned by GET /codec/schema for client code generation)
@@ -74,13 +124,18 @@ _decoder = msgspec.msgpack.Decoder()
 
 
 def encode_msgpack(
-    ids: List[int],
+    ids: IdsLike,
     *,
     done: bool,
     finish_reason: Optional[str] = None,
     tool_calls: Optional[List[dict]] = None,
 ) -> bytes:
-    frame: dict = {"ids": ids, "done": done}
+    # The wire bytes are identical regardless of input type — msgspec
+    # encodes the resulting List[int] to msgpack the same way either way.
+    # The bypass path saves CPU upstream (no PyLong-list creation in
+    # tokenizer_manager when output_ids surfaces as a numpy buffer).
+    ids_list = ids if isinstance(ids, list) else _normalise_ids_to_list(ids)
+    frame: dict = {"ids": ids_list, "done": done}
     if finish_reason is not None:
         frame["finish_reason"] = finish_reason
     if tool_calls:
@@ -132,7 +187,7 @@ def _encode_tool_call_msg(call: dict) -> bytes:
 
 
 def encode_protobuf(
-    ids: List[int],
+    ids: IdsLike,
     *,
     done: bool,
     finish_reason: Optional[str] = None,
@@ -142,8 +197,9 @@ def encode_protobuf(
     parts: list[bytes] = []
 
     # Field 1: repeated uint32 ids [packed]
-    if ids:
-        packed = b"".join(_varint(i) for i in ids)
+    ids_list = ids if isinstance(ids, list) else _normalise_ids_to_list(ids)
+    if ids_list:
+        packed = b"".join(_varint(i) for i in ids_list)
         parts.append(b"\x0a" + _varint(len(packed)) + packed)
 
     # Field 2: bool done
