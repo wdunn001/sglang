@@ -70,6 +70,11 @@ def _normalise_ids_to_list(ids: IdsLike) -> List[int]:
         # upstream half.
         return ids.tolist()
     if isinstance(ids, array.array):
+        if ids.typecode not in ("B", "H", "I", "L", "Q"):
+            raise TypeError(
+                f"codec_frame: array.array typecode {ids.typecode!r} is signed; "
+                "Codec ids are uint32, use an unsigned typecode (B/H/I/L/Q)"
+            )
         return ids.tolist()
     if isinstance(ids, (bytes, bytearray, memoryview)):
         if _HAVE_NUMPY:
@@ -161,6 +166,10 @@ def decode_msgpack(data: bytes) -> dict:
 
 
 def _varint(n: int) -> bytes:
+    if n < 0:
+        raise ValueError(
+            f"codec_frame: varint encoding requires a non-negative uint32, got {n}"
+        )
     parts: list[int] = []
     while True:
         bits = n & 0x7F
@@ -208,8 +217,12 @@ def encode_protobuf(
         packed = b"".join(_varint(i) for i in ids_list)
         parts.append(b"\x0a" + _varint(len(packed)) + packed)
 
-    # Field 2: bool done
-    parts.append(b"\x10" + (b"\x01" if done else b"\x00"))
+    # Field 2: bool done. proto3 implicit presence omits a scalar at its
+    # default (false). A missing field 2 decodes as false on any conformant
+    # reader, and skipping it saves 2 bytes on every non-final frame, about
+    # a quarter of a one-token protobuf frame.
+    if done:
+        parts.append(b"\x10\x01")
 
     # Field 3: optional string finish_reason
     if finish_reason:
@@ -271,8 +284,14 @@ def decode_protobuf_request(data: bytes) -> dict:
 
         elif wt == 2:  # length-delimited
             length = read_varint()
-            chunk = data[pos : pos + length]
-            pos += length
+            end = pos + length
+            if end > len(data):
+                raise ValueError(
+                    f"Codec: truncated length-delimited field {field}: "
+                    f"declared length {length} but only {len(data) - pos} bytes remain"
+                )
+            chunk = data[pos:end]
+            pos = end
 
             if field == 1:  # packed repeated uint32 prompt_ids
                 # Inline varint loop with the same overflow + truncation
