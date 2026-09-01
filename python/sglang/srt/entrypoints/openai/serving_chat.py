@@ -41,6 +41,7 @@ from sglang.srt.entrypoints.codec_agent import (
     detokenize_region,
     make_call_id,
     parse_tool_call,
+    split_watcher_events,
 )
 from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
 from sglang.srt.entrypoints.codec_frame import encode_frame
@@ -1587,6 +1588,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # Server-side ToolWatcher (see CompletionRequest.tool_watcher).
         watcher: Optional[ToolWatcher] = None
         tool_call_seq = 0
+        # rid is a single str for one request, a list only for a batch
+        # submitted as one GenerateReqInput. This path always streams one
+        # request. Scope the call id defensively anyway.
+        call_id_request_id = (
+            adapted_request.rid if isinstance(adapted_request.rid, str) else None
+        )
         if request.tool_watcher is not None:
             watcher = ToolWatcher(
                 start_id=int(request.tool_watcher["start_id"]),
@@ -1614,9 +1621,32 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 tool_calls_payload: list[dict] = []
                 if watcher is not None:
-                    passthrough_ids, completed_regions = watcher.feed(new_ids)
-                    new_ids = passthrough_ids
-                    for body_ids in completed_regions:
+                    events = watcher.feed(new_ids)
+                    new_ids, region_bodies, nested_starts = split_watcher_events(
+                        events
+                    )
+                    if nested_starts:
+                        logger.debug(
+                            "Codec ToolWatcher: dropped %d nested start "
+                            "marker(s) from an in-progress region body.",
+                            nested_starts,
+                        )
+                    if done:
+                        # feed() cannot see the end of the stream by itself.
+                        # end() reports a region still open at this point as
+                        # "truncated" and keeps its buffered content.
+                        truncated = watcher.end(finish_reason)
+                        if truncated:
+                            logger.warning(
+                                "Codec ToolWatcher: stream ended inside a "
+                                "tool-call region (finish_reason=%r). "
+                                "Reporting %d buffered id(s) as a best-effort "
+                                "tool call.",
+                                finish_reason,
+                                len(truncated[0].ids),
+                            )
+                            region_bodies.append(truncated[0].ids)
+                    for body_ids in region_bodies:
                         tool_call_seq += 1
                         try:
                             body_text = detokenize_region(
@@ -1625,7 +1655,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         except Exception:
                             body_text = ""
                         ev = parse_tool_call(
-                            body_text, call_id=make_call_id(tool_call_seq)
+                            body_text,
+                            call_id=make_call_id(
+                                tool_call_seq, request_id=call_id_request_id
+                            ),
                         )
                         tool_calls_payload.append(ev.to_wire_dict())
 
