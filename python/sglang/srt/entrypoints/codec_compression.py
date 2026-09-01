@@ -138,14 +138,40 @@ def get_zstd_dict_hash(stream_format: Optional[str]) -> Optional[str]:
 
 
 def _parse_accept_encoding(header: str) -> list[str]:
-    """Return the encodings the client lists, ignoring q-values."""
+    """Return the encodings the client finds acceptable, in the order they
+    appear.
+
+    We don't use q-values for ordering. Clients that explicitly want a
+    non-default preference are rare, and the server preference order
+    (zstd, br, gzip) covers the realistic case. But ``q=0`` is special:
+    RFC 9110 §12.5.3 defines it as "not acceptable", so an encoding tagged
+    ``q=0`` (e.g. ``gzip;q=0``) is excluded rather than offered. The same
+    rule applies to the ``*`` wildcard: ``*;q=0`` means "nothing not
+    otherwise listed is acceptable" and must not be treated as an offer.
+    """
     if not header:
         return []
     parts = []
     for part in header.split(","):
-        name = part.strip().split(";", 1)[0].strip().lower()
-        if name:
-            parts.append(name)
+        piece = part.strip()
+        if not piece:
+            continue
+        segments = piece.split(";")
+        name = segments[0].strip().lower()
+        if not name:
+            continue
+        q = 1.0
+        for param in segments[1:]:
+            param = param.strip().lower()
+            if param.startswith("q="):
+                try:
+                    q = float(param[2:].strip())
+                except ValueError:
+                    q = 1.0
+                break
+        if q == 0:
+            continue
+        parts.append(name)
     return parts
 
 
@@ -266,7 +292,7 @@ def wrap_streaming_response(
     from sglang.srt.entrypoints.codec_version import filter_codec_headers
 
     encoding = negotiate_encoding(accept_encoding, stream_format=stream_format)
-    headers: dict = {"Vary": "Accept-Encoding"}
+    headers: dict = {"Vary": "Accept-Encoding, Codec-Client-Version"}
     if extra_headers:
         headers.update(extra_headers)
 

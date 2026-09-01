@@ -98,12 +98,22 @@ HEADER_VERSION_INTRODUCED: dict[str, str] = {
 }
 
 
+_HEADER_VERSION_INTRODUCED_LOWER: dict[str, str] = {
+    k.lower(): v for k, v in HEADER_VERSION_INTRODUCED.items()
+}
+
+
 def should_emit_header(header_name: str, client_version: str) -> bool:
     """True iff the server may emit this header to a client speaking
     `client_version`. Headers not in the registry default to True
     (assumed v0.2 baseline or non-Codec headers like Content-Encoding).
+
+    Lookup is case-insensitive: HTTP field names are case-insensitive per
+    RFC 9110 §5.1, so a caller-supplied header differing only in case from
+    the registry's canonical spelling must still be matched to its floor
+    rather than falling through to the "always emit" default.
     """
-    floor = HEADER_VERSION_INTRODUCED.get(header_name)
+    floor = _HEADER_VERSION_INTRODUCED_LOWER.get(header_name.lower())
     if floor is None:
         return True
     return version_ge(client_version, floor)
