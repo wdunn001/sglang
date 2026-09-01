@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
-VERSION_HELPER_PATH = REPO_ROOT / "python" / "tools" / "get_version_tag.py"
+VERSION_HELPER_PATH = REPO_ROOT / "scripts" / "release" / "get_version_tag.py"
 PYPROJECT_PATHS = [
     REPO_ROOT / "python" / "pyproject.toml",
     REPO_ROOT / "python" / "pyproject_cpu.toml",
@@ -16,10 +16,10 @@ PYPROJECT_PATHS = [
     REPO_ROOT / "3rdparty" / "amd" / "wheel" / "sglang" / "pyproject.toml",
 ]
 DESCRIBE_COMMAND = (
-    'git_describe_command = ["python3", "python/tools/get_version_tag.py"]'
+    'git_describe_command = ["python3", "scripts/release/get_version_tag.py"]'
 )
 TAG_ONLY_DESCRIBE_COMMAND = (
-    'git_describe_command = ["python3", "python/tools/get_version_tag.py", '
+    'git_describe_command = ["python3", "scripts/release/get_version_tag.py", '
     '"--tag-only"]'
 )
 FALLBACK_VERSION = 'fallback_version = "0.0.0.dev0"'
@@ -33,7 +33,7 @@ def _load_module(name, path):
 
 
 register_cpu_ci = _load_module("ci_register", CI_REGISTER_PATH).register_cpu_ci
-register_cpu_ci(est_time=0, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=0, suite="base-a-test-cpu")
 
 
 class TestGetVersionTag(unittest.TestCase):
