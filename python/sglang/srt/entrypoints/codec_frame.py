@@ -279,7 +279,16 @@ def decode_protobuf_request(data: bytes) -> dict:
             if field == 2:
                 result["max_tokens"] = val
 
-        elif wt == 1:  # 64-bit fixed — skip
+        elif wt == 1:  # 64-bit fixed, skipped. CodecRequest defines no such field.
+            # Bounds-check before advancing. Without this a truncated fixed64
+            # runs `pos` past the buffer, the outer `while pos < len(data)`
+            # then exits normally, and the short frame decodes as if it were
+            # complete. Same class as the length-delimited check below.
+            if pos + 8 > len(data):
+                raise ValueError(
+                    f"Codec: truncated 64-bit field {field}: needs 8 bytes, "
+                    f"{len(data) - pos} remain"
+                )
             pos += 8
 
         elif wt == 2:  # length-delimited
